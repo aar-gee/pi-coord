@@ -262,7 +262,9 @@ export default function (pi: ExtensionAPI) {
             `[coord/${msg.channelName}] Message from **${msg.fromAlias}**${replyCtx}:`,
             msg.text,
             "",
-            `Use \`coord_reply\` with messageId="${msg.id}" to respond if needed.`,
+            `Reply with \`coord_reply\` (messageId="${msg.id}") ONLY if you have new information, a question, or a concrete result to share.`,
+            `Do NOT reply just to acknowledge, confirm receipt, say "sounds good", "great", "noted", or "thanks".`,
+            `If the message is a terminal status update (e.g. "done", "fixed", "passing") — do not reply at all.`,
           ].join("\n");
 
           pi.sendMessage(
@@ -388,7 +390,10 @@ export default function (pi: ExtensionAPI) {
       "Fire-and-forget: returns immediately without waiting for a reply. " +
       "Omit toAlias to broadcast to all channel members. " +
       "Set requiresApproval=true to request user approval on the receiving side — " +
-      "the receiver's extension will show a confirmation dialog; you will NOT receive a reply (use coord_ask for that).",
+      "the receiver's extension will show a confirmation dialog; you will NOT receive a reply (use coord_ask for that). " +
+      "ONLY send if the other agent needs to act, is blocked waiting, or needs information to continue. " +
+      "Do NOT send acknowledgements, thank-yous, or 'sounds good' replies — those add noise with no value. " +
+      "Do NOT send a follow-up message that duplicates something already covered in a previous message in the same turn.",
     promptSnippet: "Send a message to another agent via a named coordination channel",
     parameters: Type.Object({
       channel: Type.String({ description: "Channel name (e.g. CH-to-PG-migration)" }),
@@ -565,7 +570,11 @@ export default function (pi: ExtensionAPI) {
     description:
       "Reply to a specific incoming message by its id. " +
       "For messages that required approval, the reply is sent automatically by the extension after the user decides — " +
-      "you only need coord_reply for normal (non-approval) messages.",
+      "you only need coord_reply for normal (non-approval) messages. " +
+      "ONLY reply if you have new information, a concrete result, a question, or an action the sender needs to take. " +
+      "Do NOT reply to acknowledge receipt, say 'sounds good', 'great', 'noted', 'thanks', 'will do', or similar. " +
+      "Do NOT reply to a terminal status update (e.g. the sender saying 'done', 'fixed', 'tests passing', '👍'). " +
+      "Silence is a valid and preferred response when there is nothing new to add.",
     promptSnippet: "Reply to a coord message by its id",
     parameters: Type.Object({
       messageId: Type.String({ description: "The id of the message you're replying to" }),
