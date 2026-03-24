@@ -4,23 +4,28 @@
  * Design:
  *  - Channels are named topics (e.g. "CH-to-PG-migration")
  *  - Agents join channels with human-readable aliases (e.g. "taql", "team007")
- *  - Messages are fire-and-forget OR blocking ask (coord_ask blocks until reply or timeout)
+ *  - Messages are fire-and-forget (coord_send) or blocking ask (coord_ask)
  *  - Delivery: auto-inject as steering prompt (triggerTurn: true)
- *  - Approval: either agent can escalate; active session gets the confirm overlay
+ *  - Approval flow is handled ENTIRELY by the extension, never the LLM:
+ *      1. Sender sets requiresApproval=true on coord_ask — blocks waiting for a token
+ *      2. Receiver's poller sees the flag, calls ctx.ui.confirm() directly
+ *      3. Extension writes a signed ApprovalToken to the registry
+ *      4. Sender's coord_ask unblocks on the token — LLM only sees the outcome
+ *      5. coord_reply is gated: requiresApproval messages need a valid token
  *  - State lives in ~/.pi/agent/coord/ — shared across all projects, no daemon
  *
- * Slash commands (for you):
- *   /coord                   — show status (channels you're in, pending messages)
- *   /coord join <channel> <alias>   — join a channel with an alias
- *   /coord leave <channel>          — leave a channel
- *   /coord channels                 — list all channels and their members
+ * Slash commands:
+ *   /coord                          — show status
+ *   /coord join <channel> <alias>   — join (creates channel if new)
+ *   /coord leave <channel>          — leave
+ *   /coord channels                 — list all channels and members
  *
  * LLM tools:
- *   coord_send   — fire-and-forget message to a channel or specific agent alias
- *   coord_ask    — send + block waiting for reply (with timeout)
- *   coord_reply  — reply to a specific message (used by receiving agent)
- *   coord_status — read own inbox / channel state
- *   coord_approve — ask the local user for approval, returns approved/denied
+ *   coord_send    — fire-and-forget (approval flag supported)
+ *   coord_ask     — blocking send+wait (approval flag enforced end-to-end)
+ *   coord_reply   — reply to a message (gated by approval token if needed)
+ *   coord_status  — inspect channels / membership
+ *   coord_approve — STUB: explains that approval is handled by the extension
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -28,22 +33,22 @@ import { Type } from "@sinclair/typebox";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface AgentEntry {
-  sessionId: string;   // pi session file path (unique per agent instance)
-  alias: string;       // human name e.g. "taql"
-  project: string;     // cwd at join time
+  sessionId: string;
+  alias: string;
+  project: string;
   pid: number;
   joinedAt: number;
 }
 
 interface Channel {
   name: string;
-  members: AgentEntry[];  // agents currently in this channel
+  members: AgentEntry[];
   createdAt: number;
 }
 
@@ -52,34 +57,64 @@ interface Message {
   channelName: string;
   fromAlias: string;
   fromSessionId: string;
-  toAlias: string | null;   // null = broadcast to all in channel
+  toAlias: string | null;
   text: string;
-  replyToId: string | null; // if this is a reply
+  replyToId: string | null;
   requiresApproval: boolean;
   sentAt: number;
   deliveredAt: number | null;
 }
 
+/**
+ * Written by the RECEIVING agent's extension (never the LLM) after
+ * ctx.ui.confirm() returns. The sender's coord_ask polls for this token.
+ * token = HMAC-SHA256(secret, msgId + ":" + approved)  — tamper-evident.
+ */
+interface ApprovalToken {
+  messageId: string;
+  approved: boolean;
+  decidedAt: number;
+  decidedByAlias: string;    // which agent's human approved/denied
+  token: string;             // HMAC for verification
+}
+
 interface Registry {
   channels: Record<string, Channel>;
-  inboxes: Record<string, Message[]>;   // keyed by sessionId
+  inboxes: Record<string, Message[]>;       // keyed by sessionId
+  approvals: Record<string, ApprovalToken>; // keyed by messageId
 }
 
 // ─── File helpers ─────────────────────────────────────────────────────────────
 
 const COORD_DIR = join(homedir(), ".pi", "agent", "coord");
 const REGISTRY_FILE = join(COORD_DIR, "registry.json");
+const SECRET_FILE = join(COORD_DIR, ".secret");
 const LOCK_FILE = join(COORD_DIR, ".lock");
 
 async function ensureDir() {
   await mkdir(COORD_DIR, { recursive: true });
 }
 
+async function getSecret(): Promise<string> {
+  await ensureDir();
+  if (existsSync(SECRET_FILE)) {
+    return (await readFile(SECRET_FILE, "utf8")).trim();
+  }
+  const secret = randomBytes(32).toString("hex");
+  await writeFile(SECRET_FILE, secret, { mode: 0o600 });
+  return secret;
+}
+
+function signApproval(secret: string, messageId: string, approved: boolean): string {
+  return createHmac("sha256", secret)
+    .update(`${messageId}:${approved}`)
+    .digest("hex");
+}
+
 async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-  // Simple spin-lock via atomic file presence check (good enough for local use)
   const start = Date.now();
   while (existsSync(LOCK_FILE)) {
-    if (Date.now() - start > 5000) break; // bail after 5s
+    if (Date.now() - start > 5000) break;
     await new Promise(r => setTimeout(r, 50));
   }
   await writeFile(LOCK_FILE, String(process.pid));
@@ -93,10 +128,12 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
 async function readRegistry(): Promise<Registry> {
   await ensureDir();
   if (!existsSync(REGISTRY_FILE)) {
-    return { channels: {}, inboxes: {} };
+    return { channels: {}, inboxes: {}, approvals: {} };
   }
   const raw = await readFile(REGISTRY_FILE, "utf8");
-  return JSON.parse(raw) as Registry;
+  const reg = JSON.parse(raw) as Registry;
+  reg.approvals = reg.approvals ?? {};
+  return reg;
 }
 
 async function writeRegistry(reg: Registry): Promise<void> {
@@ -108,12 +145,10 @@ function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-/** Remove dead agents from all channels */
 function pruneDeadAgents(reg: Registry): Registry {
   for (const ch of Object.values(reg.channels)) {
     ch.members = ch.members.filter(m => isAlive(m.pid));
   }
-  // Remove empty channels? No — keep them so agents can rejoin.
   return reg;
 }
 
@@ -121,27 +156,27 @@ function msgId(): string {
   return randomBytes(6).toString("hex");
 }
 
-// ─── Extension ───────────────────────────────────────────────────────────────
+// ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // My own session identity — filled on session_start
   let mySessionId = "";
-  let myAlias = "";            // set when we join a channel
-  let myChannels: string[] = []; // channels I'm currently in
-
-  // Polling interval for inbox checks
+  let myAlias = "";
+  let myChannels: string[] = [];
   let pollHandle: ReturnType<typeof setInterval> | null = null;
 
-  // ── Resolve own session ID ──────────────────────────────────────────────
+  // Track messageIds currently being approval-confirmed (prevent double-prompts)
+  const pendingApprovals = new Set<string>();
+
+  // ── session_start ────────────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
     mySessionId = ctx.sessionManager.getSessionFile() ?? `ephemeral-${process.pid}`;
 
-    // Restore my channels from last run (check registry)
+    // Restore channel membership from registry
     const reg = await readRegistry();
     for (const [chName, ch] of Object.entries(reg.channels)) {
       const me = ch.members.find(m => m.sessionId === mySessionId);
       if (me) {
-        myChannels.push(chName);
+        if (!myChannels.includes(chName)) myChannels.push(chName);
         myAlias = myAlias || me.alias;
       }
     }
@@ -150,58 +185,103 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("coord", `coord: ${myAlias} (${myChannels.join(", ") || "no channels"})`);
     }
 
-    // Start inbox polling — every 3 seconds
+    // ── Inbox poller ──────────────────────────────────────────────────────
     if (pollHandle) clearInterval(pollHandle);
     pollHandle = setInterval(async () => {
       if (!mySessionId) return;
       const r = await readRegistry();
       const inbox = r.inboxes[mySessionId] ?? [];
-      if (inbox.length === 0) return;
-
-      // Mark delivered and clear inbox
       const pending = inbox.filter(m => !m.deliveredAt);
       if (pending.length === 0) return;
 
-      await withLock(async () => {
-        const r2 = await readRegistry();
-        const box = r2.inboxes[mySessionId] ?? [];
-        for (const m of box) {
-          if (!m.deliveredAt) m.deliveredAt = Date.now();
-        }
-        await writeRegistry(r2);
-      });
-
-      // Deliver each message as a steering prompt
       for (const msg of pending) {
-        const label = msg.requiresApproval ? " [NEEDS YOUR APPROVAL]" : "";
-        const replyCtx = msg.replyToId ? ` (reply to msg ${msg.replyToId})` : "";
-        const text = [
-          `[coord/${msg.channelName}] Message from **${msg.fromAlias}**${replyCtx}${label}:`,
-          msg.text,
-          "",
-          msg.requiresApproval
-            ? `This action requires user approval. Use \`coord_approve\` to ask the user, then reply with \`coord_reply\`.`
-            : `Use \`coord_reply\` with id="${msg.id}" to respond if needed.`,
-        ].join("\n");
+        if (msg.requiresApproval && !msg.replyToId) {
+          // ── APPROVAL PATH: handled entirely by the extension ─────────────
+          // Guard against double-prompting if poller fires again before confirm resolves
+          if (pendingApprovals.has(msg.id)) continue;
+          pendingApprovals.add(msg.id);
 
-        pi.sendMessage(
-          { customType: "coord-message", content: text, display: true },
-          { triggerTurn: true, deliverAs: "steer" }
-        );
+          // Mark delivered now so we don't re-prompt on next poll tick
+          await withLock(async () => {
+            const r2 = await readRegistry();
+            const box = r2.inboxes[mySessionId] ?? [];
+            const m = box.find(x => x.id === msg.id);
+            if (m && !m.deliveredAt) m.deliveredAt = Date.now();
+            await writeRegistry(r2);
+          });
+
+          // Show confirmation dialog directly — LLM is not involved
+          const approved = await ctx.ui.confirm(
+            `[coord] Approval request from "${msg.fromAlias}" (${msg.channelName})`,
+            `"${msg.text}"\n\nApprove this action?`,
+          );
+
+          // Write signed token to registry
+          const secret = await getSecret();
+          const token: ApprovalToken = {
+            messageId: msg.id,
+            approved,
+            decidedAt: Date.now(),
+            decidedByAlias: myAlias,
+            token: signApproval(secret, msg.id, approved),
+          };
+          await withLock(async () => {
+            const r2 = await readRegistry();
+            r2.approvals[msg.id] = token;
+            await writeRegistry(r2);
+          });
+
+          pendingApprovals.delete(msg.id);
+
+          // Inform the LLM of the outcome as context only (cannot change it)
+          const outcome = approved ? "✅ APPROVED" : "❌ DENIED";
+          pi.sendMessage(
+            {
+              customType: "coord-approval-outcome",
+              content: `[coord] Approval from "${msg.fromAlias}" for "${msg.text}" — ${outcome} by user.\n\nThe approval token has been written to the registry. ${msg.fromAlias}'s coord_ask will unblock automatically.`,
+              display: true,
+            },
+            { deliverAs: "steer", triggerTurn: false },
+          );
+
+          ctx.ui.setStatus("coord", `coord: ${myAlias} (${myChannels.join(", ")})`);
+
+        } else {
+          // ── NORMAL MESSAGE PATH ───────────────────────────────────────────
+          // Mark delivered
+          await withLock(async () => {
+            const r2 = await readRegistry();
+            const box = r2.inboxes[mySessionId] ?? [];
+            const m = box.find(x => x.id === msg.id);
+            if (m && !m.deliveredAt) m.deliveredAt = Date.now();
+            await writeRegistry(r2);
+          });
+
+          const replyCtx = msg.replyToId ? ` (reply to msg ${msg.replyToId})` : "";
+          const text = [
+            `[coord/${msg.channelName}] Message from **${msg.fromAlias}**${replyCtx}:`,
+            msg.text,
+            "",
+            `Use \`coord_reply\` with messageId="${msg.id}" to respond if needed.`,
+          ].join("\n");
+
+          pi.sendMessage(
+            { customType: "coord-message", content: text, display: true },
+            { triggerTurn: true, deliverAs: "steer" },
+          );
+
+          ctx.ui.setStatus("coord", `coord: ${myAlias} (${myChannels.join(", ")}) ●`);
+          setTimeout(() => {
+            ctx.ui.setStatus("coord", `coord: ${myAlias} (${myChannels.join(", ")})`);
+          }, 8000);
+        }
       }
-
-      // Update status bar unread count
-      const total = (r.inboxes[mySessionId] ?? []).length;
-      ctx.ui.setStatus("coord", `coord: ${myAlias || "?"} (${myChannels.join(", ")}) ●${pending.length}`);
-      setTimeout(() => {
-        ctx.ui.setStatus("coord", `coord: ${myAlias || "?"} (${myChannels.join(", ")})`);
-      }, 8000);
     }, 3000);
   });
 
+  // ── session_shutdown ─────────────────────────────────────────────────────
   pi.on("session_shutdown", async (_event, _ctx) => {
     if (pollHandle) clearInterval(pollHandle);
-    // Update registry — mark self as offline (remove from members)
     if (!mySessionId) return;
     await withLock(async () => {
       const reg = await readRegistry();
@@ -212,7 +292,7 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // ── /coord command ──────────────────────────────────────────────────────
+  // ── /coord command ────────────────────────────────────────────────────────
   pi.registerCommand("coord", {
     description: "Manage coordination channels. Usage: /coord [join <channel> <alias> | leave <channel> | channels | status]",
     handler: async (args, ctx) => {
@@ -232,7 +312,6 @@ export default function (pi: ExtensionAPI) {
             reg.channels[channelName] = { name: channelName, members: [], createdAt: Date.now() };
           }
           const ch = reg.channels[channelName];
-          // Remove stale entry for this session
           ch.members = ch.members.filter(m => m.sessionId !== mySessionId);
           ch.members.push({
             sessionId: mySessionId,
@@ -243,7 +322,6 @@ export default function (pi: ExtensionAPI) {
           });
           await writeRegistry(reg);
         });
-
         myAlias = alias;
         if (!myChannels.includes(channelName)) myChannels.push(channelName);
         ctx.ui.setStatus("coord", `coord: ${myAlias} (${myChannels.join(", ")})`);
@@ -261,7 +339,7 @@ export default function (pi: ExtensionAPI) {
           const reg = await readRegistry();
           if (reg.channels[channelName]) {
             reg.channels[channelName].members = reg.channels[channelName].members.filter(
-              m => m.sessionId !== mySessionId
+              m => m.sessionId !== mySessionId,
             );
           }
           await writeRegistry(reg);
@@ -294,33 +372,30 @@ export default function (pi: ExtensionAPI) {
       const reg = pruneDeadAgents(await readRegistry());
       const inbox = reg.inboxes[mySessionId] ?? [];
       const unread = inbox.filter(m => !m.deliveredAt).length;
-      const chList = myChannels.length > 0 ? myChannels.join(", ") : "none";
-      const aliasStr = myAlias ? `"${myAlias}"` : "not registered";
       ctx.ui.notify(
-        `coord status:\n  alias: ${aliasStr}\n  channels: ${chList}\n  inbox: ${inbox.length} messages (${unread} undelivered)`,
-        "info"
+        `coord status:\n  alias: ${myAlias ? `"${myAlias}"` : "not registered"}\n  channels: ${myChannels.join(", ") || "none"}\n  inbox: ${inbox.length} messages (${unread} undelivered)`,
+        "info",
       );
     },
   });
 
-  // ── LLM Tool: coord_send ─────────────────────────────────────────────────
+  // ── coord_send ────────────────────────────────────────────────────────────
   pi.registerTool({
     name: "coord_send",
     label: "Coord Send",
-    description: [
-      "Send a message to another agent via a coordination channel.",
-      "Use this to share information, results, or hand off work.",
-      "If the channel has multiple members, specify `toAlias` to target one agent.",
-      "If `toAlias` is omitted, the message is broadcast to all channel members.",
-      "This is fire-and-forget: the tool returns immediately without waiting for a reply.",
-    ].join(" "),
+    description:
+      "Send a message to another agent via a coordination channel. " +
+      "Fire-and-forget: returns immediately without waiting for a reply. " +
+      "Omit toAlias to broadcast to all channel members. " +
+      "Set requiresApproval=true to request user approval on the receiving side — " +
+      "the receiver's extension will show a confirmation dialog; you will NOT receive a reply (use coord_ask for that).",
     promptSnippet: "Send a message to another agent via a named coordination channel",
     parameters: Type.Object({
       channel: Type.String({ description: "Channel name (e.g. CH-to-PG-migration)" }),
       message: Type.String({ description: "The message to send" }),
       toAlias: Type.Optional(Type.String({ description: "Target agent alias. Omit to broadcast." })),
       requiresApproval: Type.Optional(Type.Boolean({
-        description: "Set true if the recipient needs to get user approval before acting. The receiving agent will use coord_approve.",
+        description: "If true, the receiver's extension shows a user confirmation dialog before the message is delivered to their LLM.",
       })),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -337,8 +412,7 @@ export default function (pi: ExtensionAPI) {
           : ch.members.filter(m => m.sessionId !== mySessionId);
 
         if (targets.length === 0) {
-          const all = ch.members.map(m => m.alias).join(", ");
-          throw new Error(`No target found. Channel members: ${all || "none (just you)"}`);
+          throw new Error(`No target found in channel "${params.channel}". Members: ${ch.members.map(m => m.alias).join(", ") || "none (just you)"}`);
         }
 
         const messages: Message[] = targets.map(t => ({
@@ -355,8 +429,6 @@ export default function (pi: ExtensionAPI) {
         }));
 
         for (const msg of messages) {
-          reg.inboxes[msg.toAlias] = reg.inboxes[msg.toAlias] ?? [];
-          // find session id for this alias in the channel
           const target = ch.members.find(m => m.alias === msg.toAlias)!;
           reg.inboxes[target.sessionId] = reg.inboxes[target.sessionId] ?? [];
           reg.inboxes[target.sessionId].push(msg);
@@ -366,24 +438,22 @@ export default function (pi: ExtensionAPI) {
         return messages;
       });
 
-      const ids = result.map(m => `${m.toAlias}:${m.id}`).join(", ");
       return {
-        content: [{ type: "text", text: `Message sent to ${result.map(m => m.toAlias).join(", ")} in channel "${params.channel}". Message IDs: ${ids}` }],
+        content: [{ type: "text", text: `Message sent to ${result.map(m => m.toAlias).join(", ")} in "${params.channel}". IDs: ${result.map(m => m.id).join(", ")}` }],
         details: { messageIds: result.map(m => m.id) },
       };
     },
   });
 
-  // ── LLM Tool: coord_ask ──────────────────────────────────────────────────
+  // ── coord_ask ─────────────────────────────────────────────────────────────
   pi.registerTool({
     name: "coord_ask",
     label: "Coord Ask",
-    description: [
-      "Send a message to another agent and WAIT for a reply (blocking).",
-      "Times out after `timeoutSeconds` (default 120).",
-      "Returns the reply text or a timeout error.",
-      "Use this when you need information or a result before continuing.",
-    ].join(" "),
+    description:
+      "Send a message to another agent and WAIT for a reply (blocking, default 120s timeout). " +
+      "If requiresApproval=true, the message is held until the receiving user approves or denies it " +
+      "via a confirmation dialog shown by their extension — the LLM on their side is not involved in the approval decision. " +
+      "coord_ask returns the reply text (or approval outcome) when done.",
     promptSnippet: "Send a message to an agent and wait for their reply",
     parameters: Type.Object({
       channel: Type.String({ description: "Channel name" }),
@@ -391,7 +461,7 @@ export default function (pi: ExtensionAPI) {
       toAlias: Type.String({ description: "Alias of the agent to ask" }),
       timeoutSeconds: Type.Optional(Type.Number({ description: "How long to wait (default 120s)" })),
       requiresApproval: Type.Optional(Type.Boolean({
-        description: "Set true if the recipient needs user approval before acting.",
+        description: "If true, the receiving user must approve before their agent acts. The extension handles this — not the LLM.",
       })),
     }),
     async execute(_id, params, signal, _onUpdate, _ctx) {
@@ -399,13 +469,14 @@ export default function (pi: ExtensionAPI) {
       if (!myAlias) throw new Error("Not in any channel. Ask the user to run /coord join <channel> <alias> first.");
 
       const timeout = (params.timeoutSeconds ?? 120) * 1000;
+
       const sentMsg = await withLock(async () => {
         const reg = pruneDeadAgents(await readRegistry());
         const ch = reg.channels[params.channel];
         if (!ch) throw new Error(`Channel "${params.channel}" does not exist.`);
 
         const target = ch.members.find(m => m.alias === params.toAlias);
-        if (!target) throw new Error(`Agent "${params.toAlias}" not found in channel "${params.channel}". Members: ${ch.members.map(m => m.alias).join(", ")}`);
+        if (!target) throw new Error(`Agent "${params.toAlias}" not found in "${params.channel}". Members: ${ch.members.map(m => m.alias).join(", ")}`);
 
         const msg: Message = {
           id: msgId(),
@@ -426,39 +497,75 @@ export default function (pi: ExtensionAPI) {
         return msg;
       });
 
-      // Poll for a reply addressed back to us with replyToId = sentMsg.id
       const deadline = Date.now() + timeout;
-      while (Date.now() < deadline) {
-        if (signal?.aborted) throw new Error("Cancelled");
-        await new Promise(r => setTimeout(r, 1500));
-        const reg = await readRegistry();
-        const inbox = reg.inboxes[mySessionId] ?? [];
-        const reply = inbox.find(m => m.replyToId === sentMsg.id);
-        if (reply) {
-          // Mark reply as delivered
+      const secret = await getSecret();
+
+      if (params.requiresApproval) {
+        // ── Wait for an ApprovalToken written by the receiver's extension ──
+        while (Date.now() < deadline) {
+          if (signal?.aborted) throw new Error("Cancelled");
+          await new Promise(r => setTimeout(r, 1500));
+
+          const reg = await readRegistry();
+          const tok = reg.approvals[sentMsg.id];
+          if (!tok) continue;
+
+          // Verify the HMAC — reject if tampered
+          const expected = signApproval(secret, tok.messageId, tok.approved);
+          if (tok.token !== expected) {
+            throw new Error(`Approval token for message ${sentMsg.id} failed verification. Possible tampering.`);
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: tok.approved
+                ? `User on "${tok.decidedByAlias}" side APPROVED: "${params.message}". You may proceed.`
+                : `User on "${tok.decidedByAlias}" side DENIED: "${params.message}". Do not proceed.`,
+            }],
+            details: { approved: tok.approved, decidedByAlias: tok.decidedByAlias },
+          };
+        }
+        throw new Error(`Approval for message ${sentMsg.id} not received within ${params.timeoutSeconds ?? 120}s.`);
+
+      } else {
+        // ── Wait for a normal coord_reply ────────────────────────────────
+        while (Date.now() < deadline) {
+          if (signal?.aborted) throw new Error("Cancelled");
+          await new Promise(r => setTimeout(r, 1500));
+
+          const reg = await readRegistry();
+          const inbox = reg.inboxes[mySessionId] ?? [];
+          const reply = inbox.find(m => m.replyToId === sentMsg.id);
+          if (!reply) continue;
+
+          // Mark delivered
           await withLock(async () => {
             const r2 = await readRegistry();
             const box = r2.inboxes[mySessionId] ?? [];
-            const r = box.find(m => m.id === reply.id);
-            if (r) r.deliveredAt = Date.now();
+            const m = box.find(x => x.id === reply.id);
+            if (m) m.deliveredAt = Date.now();
             await writeRegistry(r2);
           });
+
           return {
             content: [{ type: "text", text: `Reply from ${reply.fromAlias}: ${reply.text}` }],
             details: { replyId: reply.id, fromAlias: reply.fromAlias },
           };
         }
+        throw new Error(`No reply from "${params.toAlias}" within ${params.timeoutSeconds ?? 120}s.`);
       }
-
-      throw new Error(`No reply from "${params.toAlias}" within ${params.timeoutSeconds ?? 120}s.`);
     },
   });
 
-  // ── LLM Tool: coord_reply ────────────────────────────────────────────────
+  // ── coord_reply ───────────────────────────────────────────────────────────
   pi.registerTool({
     name: "coord_reply",
     label: "Coord Reply",
-    description: "Reply to a specific incoming message. Use the message id from the coord message you received.",
+    description:
+      "Reply to a specific incoming message by its id. " +
+      "For messages that required approval, the reply is sent automatically by the extension after the user decides — " +
+      "you only need coord_reply for normal (non-approval) messages.",
     promptSnippet: "Reply to a coord message by its id",
     parameters: Type.Object({
       messageId: Type.String({ description: "The id of the message you're replying to" }),
@@ -470,13 +577,29 @@ export default function (pi: ExtensionAPI) {
       await withLock(async () => {
         const reg = await readRegistry();
 
-        // Find original message anywhere in inboxes
+        // Find original message
         let original: Message | null = null;
         for (const msgs of Object.values(reg.inboxes)) {
           const found = msgs.find(m => m.id === params.messageId);
           if (found) { original = found; break; }
         }
         if (!original) throw new Error(`Message id "${params.messageId}" not found.`);
+
+        // Gate: if the original required approval, a valid token must exist
+        if (original.requiresApproval) {
+          const tok = reg.approvals[params.messageId];
+          if (!tok) {
+            throw new Error(
+              `Message "${params.messageId}" required user approval but no approval token exists yet. ` +
+              `The receiving user has not decided yet — wait for coord_ask to return the outcome.`,
+            );
+          }
+          if (!tok.approved) {
+            throw new Error(
+              `Message "${params.messageId}" was DENIED by the user. You may not reply as if it was approved.`,
+            );
+          }
+        }
 
         const reply: Message = {
           id: msgId(),
@@ -503,7 +626,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── LLM Tool: coord_status ───────────────────────────────────────────────
+  // ── coord_status ──────────────────────────────────────────────────────────
   pi.registerTool({
     name: "coord_status",
     label: "Coord Status",
@@ -518,20 +641,20 @@ export default function (pi: ExtensionAPI) {
       if (params.channel) {
         const ch = reg.channels[params.channel];
         if (!ch) {
-          const all = Object.keys(reg.channels).join(", ") || "none";
           return {
-            content: [{ type: "text", text: `Channel "${params.channel}" not found. Existing channels: ${all}` }],
+            content: [{ type: "text", text: `Channel "${params.channel}" not found. Existing: ${Object.keys(reg.channels).join(", ") || "none"}` }],
             details: {},
           };
         }
-        const members = ch.members.map(m => `  - ${m.alias} (project: ${m.project}, pid: ${m.pid})`).join("\n");
+        const members = ch.members.length === 0
+          ? "  (empty)"
+          : ch.members.map(m => `  - ${m.alias} (project: ${m.project}, pid: ${m.pid})`).join("\n");
         return {
-          content: [{ type: "text", text: `Channel "${params.channel}" members:\n${members || "  (empty)"}` }],
+          content: [{ type: "text", text: `Channel "${params.channel}":\n${members}` }],
           details: { channel: ch },
         };
       }
 
-      // All channels
       if (Object.keys(reg.channels).length === 0) {
         return {
           content: [{ type: "text", text: "No coordination channels exist yet. Ask the user to run /coord join <channel> <alias>." }],
@@ -539,12 +662,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const lines: string[] = [];
-      for (const [name, ch] of Object.entries(reg.channels)) {
+      const lines = Object.entries(reg.channels).map(([name, ch]) => {
         const mine = myChannels.includes(name) ? " [you're here]" : "";
         const members = ch.members.map(m => `${m.alias}@${m.project}`).join(", ") || "(empty)";
-        lines.push(`  ${name}${mine}: ${members}`);
-      }
+        return `  ${name}${mine}: ${members}`;
+      });
 
       return {
         content: [{ type: "text", text: `Coordination channels:\n${lines.join("\n")}` }],
@@ -553,35 +675,30 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── LLM Tool: coord_approve ──────────────────────────────────────────────
+  // ── coord_approve (stub) ──────────────────────────────────────────────────
   pi.registerTool({
     name: "coord_approve",
     label: "Coord Approve",
-    description: [
-      "Ask the LOCAL USER for approval to perform an action requested by another agent.",
-      "Shows a confirmation dialog. Returns approved=true or approved=false with optional user note.",
-      "Use this when you receive a coord message with requiresApproval=true,",
-      "OR when another agent's request would make changes to your project.",
-    ].join(" "),
-    promptSnippet: "Ask the user for approval on a cross-agent action",
+    description:
+      "NOTE: Approval is handled automatically by the pi-coord extension — you do not need to call this tool. " +
+      "When a message arrives with requiresApproval=true, the extension intercepts it and shows the user a " +
+      "confirmation dialog directly. The LLM is informed of the outcome via a steering message. " +
+      "This tool exists only for documentation purposes and always returns an explanation.",
+    promptSnippet: "Approval is handled by the extension — do not call this directly",
     parameters: Type.Object({
-      action: Type.String({ description: "Plain-language description of what the other agent wants to do" }),
-      requestedBy: Type.String({ description: "Alias of the agent making the request" }),
-      channel: Type.String({ description: "Channel this came through" }),
+      messageId: Type.Optional(Type.String({ description: "Message id (informational only)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      const title = `[coord] Approval Request from "${params.requestedBy}" (${params.channel})`;
-      const question = `Action: ${params.action}\n\nApprove?`;
-      const approved = await ctx.ui.confirm(title, question);
-
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
       return {
         content: [{
           type: "text",
-          text: approved
-            ? `User approved: "${params.action}". You may proceed and then use coord_reply to inform ${params.requestedBy}.`
-            : `User denied: "${params.action}". Reply to ${params.requestedBy} that the action was not approved.`,
+          text:
+            "Approval is handled automatically by the pi-coord extension, not by the LLM. " +
+            "When a requiresApproval message arrives, the extension shows a confirmation dialog to the user directly. " +
+            "The outcome is written as a signed token to the registry — coord_ask on the sender side unblocks on that token. " +
+            "You do not need to call coord_approve.",
         }],
-        details: { approved },
+        details: {},
       };
     },
   });
