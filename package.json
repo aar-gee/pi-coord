@@ -1,0 +1,8 @@
+{
+  "name": "pi-coord",
+  "version": "1.0.0",
+  "description": "Lightweight multi-agent coordination channels for pi. No daemon, file-based, on-demand only.",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
